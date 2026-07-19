@@ -1398,7 +1398,7 @@ PITR = 基础备份 + 归档 WAL 重放到指定目标：
 **组提交**：
 
 - `9b38d46d9f`（2012-01-30，Heikki，PG 9.2）"Make group commit more effective."——引入"等锁者醒来先复查、不重复 fsync"的协议（配套原语 `1a01560cbb` 定名 `LWLockAcquireOrWait`）。在此之前 fsync 队列是串行的，fsync 慢盘上 N 个并发提交近似 N 次 fsync；之后近似 1 次。§4.1 的 (a)(c)(d) 就是这个 commit 的遗产；
-- `f11e8be3e8`（2012-07-02）"Make commit_delay much smarter."——把 `commit_delay` 的睡眠从"每个提交者都睡"改成"只有拿到 WALWriteLock 的组长睡"，старый 版本的 commit_delay 因此从"几乎总是有害"变成"偶尔有用"（§4.1 (e)）。
+- `f11e8be3e8`（2012-07-02）"Make commit_delay much smarter."——把 `commit_delay` 的睡眠从"每个提交者都睡"改成"只有拿到 WALWriteLock 的组长睡"，旧版本的 commit_delay 因此从"几乎总是有害"变成"偶尔有用"（§4.1 (e)）。
 
 **FPW 的代价控制**：
 

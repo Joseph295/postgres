@@ -140,6 +140,29 @@ PG 的采样是**两阶段**的：第一阶段随机选**块**，第二阶段在
 - 命中时随机选水库下标 k 替换。归纳不变式（analyze.c:1319-1329 的注释）：**任意时刻水库都是已扫过行的均匀随机样本**，所以扫到表尾即得最终样本；
 - 注意两阶段是**交织执行**的（analyze.c:1244-1247 注释）：块的选择由 read stream 回调驱动，行的水库逻辑对"被选中块内的行流"运作，Vitter 算法根本不需要预知总行数——这正是它相对 Knuth S 的价值（块数已知可用 S，行数未知必须用 Z）。
 
+`reservoir_get_next_S()` 内部的两档切换值得多看一眼（sampling.c:147-226）。t 尚小（`t <= 22.0 * n`，22 是 Vitter 论文的门槛常数 T）时用 Algorithm X——逐步累乘直到不等式翻转：
+
+```c
+		/* Process records using Algorithm X until t is large enough */
+		double		V,
+					quot;
+
+		V = sampler_random_fract(&rs->randstate);	/* Generate V */
+		S = 0;
+		t += 1;
+		/* Note: "num" in Vitter's code is always equal to t - n */
+		quot = (t - (double) n) / t;
+		/* Find min S satisfying (4.1) */
+		while (quot > V)
+		{
+			S += 1;
+			t += 1;
+			quot *= (t - (double) n) / t;
+		}
+```
+
+`quot` 是"接下来 S+1 行全部不入选"的概率 ∏(t−n+i)/(t+i)；生成一个均匀随机 V，找到使该概率首次跌破 V 的最小 S——一次随机数决定整段跳跃，但循环步数仍与 S 成正比。t 大之后切到 Algorithm Z（sampling.c:171-224）：用连续分布 g(x) 近似 S 的离散分布做**拒绝采样**——先从近似分布抽一个候选 X = t·(W−1)，再用两道验收测试（先廉价的 h(S)/cg(X)，不过关再算精确的 f(S)/cg(X)）决定接受或重抽。期望只需 O(1) 次随机数与对数运算，且与跳跃长度无关——这就是"扫亿行只醒几万次"的数学保障。状态变量 W 跨调用携带（`rs->W`，sampling.c:223），摊还了近似分布的参数计算。
+
 **收尾**（analyze.c:1379-1394）：
 
 ```c
