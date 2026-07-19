@@ -1214,3 +1214,72 @@ Hive 的分区是**文件系统布局的衍生物**，扩展性来自"不管理"
 - `src/backend/jit/README`：JIT 的架构与 bitcode inline 机制；
 - `src/backend/partitioning/`、`src/backend/executor/execPartition.c` 头部注释：分区裁剪与路由的导览；
 - Vitter, "Random sampling with a reservoir", ACM TOMS 1985；Chaudhuri et al., "Random sampling for histogram construction", SIGMOD 1998；Haas & Stokes, IBM RJ 10025（ndistinct 估计器）；Neumann, "Efficiently Compiling Efficient Query Plans for Modern Hardware", VLDB 2011（HyPer 编译路线，与 PG 渐进路线对照）。
+
+---
+
+## 附录：本篇引用的函数/位置核实清单（20devel master）
+
+统计信息：
+
+| 符号 | 位置 |
+|---|---|
+| `analyze_rel` / `do_analyze_rel` | commands/analyze.c:110 / 306 |
+| `block_sampling_read_stream_next` | commands/analyze.c:1219 |
+| `acquire_sample_rows`（主循环 / 回排 / 外推） | commands/analyze.c:1262（1312-1364 / 1379-1381 / 1390-1394） |
+| `compare_rows` | commands/analyze.c:1420 |
+| `update_attstats` | commands/analyze.c:1714 |
+| `std_typanalyze`（minrows = 300×target） | commands/analyze.c:1950（1999） |
+| `compute_trivial_stats` / `compute_distinct_stats` | commands/analyze.c:2028 / 2118 |
+| `compute_scalar_stats`（排序 / 单遍扫描 / Duj1 / MCV 判据 / 直方图 / 相关性） | commands/analyze.c:2461（2572 / 2594-2637 / 2689-2717 / 2735-2761 / 2803-2910 / 2913-2949） |
+| `analyze_mcv_list` | commands/analyze.c:3039 |
+| `BlockSampler_Init` / `BlockSampler_Next` | utils/misc/sampling.c:39 / 64 |
+| `reservoir_init_selection_state` / `reservoir_get_next_S` | utils/misc/sampling.c:133 / 147 |
+| `stadistinct` 语义 / 槽位宏 / 三种 kind | include/catalog/pg_statistic.h:71 / 90-131 / 194-226 |
+| `clauselist_selectivity` / `_ext` | optimizer/path/clausesel.c:100 / 117 |
+| `statext_clauselist_selectivity` / `statext_mcv_clauselist_selectivity` | statistics/extended_stats.c:2024 / 1737 |
+| `mcv_clauselist_selectivity` / `statext_ndistinct_build` | statistics/mcv.c:2043 / statistics/mvdistinct.c:85 |
+| `dependencies_clauselist_selectivity` / `find_strongest_dependency` / `clauselist_apply_dependencies`（公式） | statistics/dependencies.c:1350 / 911 / 994（1106-1120） |
+
+并行查询：
+
+| 符号 | 位置 |
+|---|---|
+| `PARALLEL_KEY_*` 清单 | access/transam/parallel.c:67-81 |
+| `CreateParallelContext` / `InitializeParallelDSM` | parallel.c:175 / 213 |
+| DSM 降级路径 / 逐项序列化 / 错误队列 / 入口点 | parallel.c:328-341 / 384-456 / 468-482 / 484-496 |
+| `LaunchParallelWorkers`（注册失败处理） | parallel.c:583（626-653） |
+| `ParallelWorkerMain` | parallel.c:1301 |
+| `ExecInitParallelPlan`（PLANNEDSTMT 序列化 / 元组队列） | executor/execParallel.c:653（820-823 / 622-642，队列大小 71） |
+| `ExecGather` / `gather_getnext` / `gather_readnext` | executor/nodeGather.c:138 / 264 / 312 |
+| `gather_merge_getnext` / `load_tuple_array` / 堆分配 | executor/nodeGatherMerge.c:547 / 597 / 430 |
+| `TupleQueueReaderNext` | executor/tqueue.c:176 |
+| shm_mq 结构与同步注释 / `shm_mq_create` / `shm_mq_send` / `shm_mq_sendv` / `shm_mq_receive` | storage/ipc/shm_mq.c:31-84 / 179 / 331 / 363 / 574 |
+| `shm_mq_send_bytes` / `shm_mq_receive_bytes` / `shm_mq_inc_bytes_read` / `shm_mq_inc_bytes_written` | shm_mq.c:916 / 1081 / 1272 / 1305（屏障 1044 / 1118 / 1283 / 1312） |
+| `compute_parallel_worker`（log₃ 循环） | optimizer/path/allpaths.c:4973（5009-5018） |
+| `max_parallel_hazard` / `is_parallel_safe` / `max_parallel_hazard_test` | optimizer/util/clauses.c:763 / 782 / 823 |
+| `PROPARALLEL_*` | include/catalog/pg_proc.h:177-179 |
+| partial/finalize 聚合标记 | optimizer/plan/planner.c:5988 / 7511；`create_partial_grouping_paths` 7606 |
+
+JIT：
+
+| 符号 | 位置 |
+|---|---|
+| `jit_provider` / 阈值默认值 / `provider_init` / `jit_compile_expr` | jit/jit.c:34 / 40-42 / 68 / 152 |
+| `ExecReadyExpr` | executor/execExpr.c:902 |
+| `llvm_compile_expr`（上下文 / 函数骨架 / 序幕 / opblocks / 主循环） | jit/llvm/llvmjit_expr.c:80（145-152 / 164-170 / 179-299 / 302-307 / 309-324） |
+| `EEOP_FUNCEXPR*` / `EEOP_QUAL` 翻译 | llvmjit_expr.c:665-751 / 972-1007 |
+| `llvm_inline` / 搜索路径 / bitcode 打开 / 索引 | jit/llvm/llvmjit_inline.cpp:167 / 192、253 / 492 / 812 |
+| jitFlags 决策 | optimizer/plan/planner.c:698-720 |
+
+分区表：
+
+| 符号 | 位置 |
+|---|---|
+| `PartitionBoundInfoData`（编码注释） | include/partitioning/partbounds.h:79-96（22-77） |
+| `partition_bounds_create` / `partition_bounds_equal` | partitioning/partbounds.c:300 / 889 |
+| `partition_list_bsearch` / `partition_range_datum_bsearch` | partbounds.c:3600 / 3688 |
+| `make_partition_pruneinfo` / `gen_partprune_steps` / `prune_append_rel_partitions` / `get_matching_partitions` / `gen_partprune_steps_internal` | partitioning/partprune.c:225 / 744 / 780 / 846 / 990 |
+| `ExecFindPartition` / `get_partition_for_tuple` | executor/execPartition.c:268 / 1570 |
+| `ExecDoInitialPruning` / `ExecInitPartitionExecPruning` / `CreatePartitionPruneState` | execPartition.c:1995 / 2051 / 2145 |
+| `try_partitionwise_join` / `create_partitionwise_grouping_paths` | optimizer/path/joinrels.c:1611 / optimizer/plan/planner.c:8383 |
+| partitionwise GUC 默认值 / `max_parallel_workers_per_gather` | optimizer/path/costsize.c:161-162 / 144 |
