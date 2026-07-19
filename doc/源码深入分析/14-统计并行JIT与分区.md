@@ -609,7 +609,13 @@ struct shm_mq
 			SetLatch(&mq->mq_receiver->procLatch);
 			mqh->mqh_send_pending = 0;
 
-			if (nowait) { *bytes_written = sent; return SHM_MQ_WOULD_BLOCK; }
+			/* Skip manipulation of our latch if nowait = true. */
+			if (nowait)
+			{
+				*bytes_written = sent;
+				return SHM_MQ_WOULD_BLOCK;
+			}
+
 			(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH, 0,
 							 WAIT_EVENT_MESSAGE_QUEUE_SEND);
 			ResetLatch(MyLatch);
