@@ -1312,4 +1312,228 @@ LWLock 的获取/释放自带全屏障。逐情形穷举：若弱锁方读 C 时
 
 ---
 
+## 8.7 行锁：写进元组的锁
+
+### 8.7.1 所以然：行锁为什么进 xmax 而不进锁表？——内存量化对比
+
+InnoDB 的行锁（记录锁、间隙锁、next-key 锁）是内存中的锁结构；PG 的行锁**根本不在锁表里**：给一行加锁 = 把自己的 XID 写进该行的 `t_xmax`，并用 infomask 标注"这只是锁不是删除"。先把两种方案的账算清楚：
+
+**方案 A（锁表方案）：`SELECT ... FOR UPDATE` 锁一百万行。**PG 的共享锁表每条锁要一个 LOCK 对象 + 一个 PROCLOCK 对象（合计约 200~300 字节，含哈希开销），一百万行 ≈ **200~300 MB 共享内存**。更致命的是：PG 的锁表是**启动时定容**的共享内存（容量 ≈ `max_locks_per_transaction × (max_connections + max_prepared_transactions)`，默认 64 × ~100 ≈ **6400 条**），一百万行锁在默认配置下连零头都装不下——第 6400 行就报 "out of shared memory"。传统数据库对此的补丁是**锁升级**（SQL Server/DB2：行锁太多就升成表锁），代价是并发度骤降和升级本身引发的死锁。InnoDB 用每页位图压缩（一个锁结构覆盖一页内多行），一百万行约几 MB，好得多但仍是 buffer pool 里的真实内存，且锁结构本身参与 lock_sys 互斥的争用。
+
+**方案 B（PG 的 xmax 方案）：同样一百万行。**共享内存增量 **0 字节**——锁状态写在每行元组头**本来就存在**的 xmax 字段（4 字节，复用不新增）+ infomask 位里。无容量上限、无锁升级、锁多少行都不会 "out of memory"。
+
+天下没有免费的午餐，代价三笔：
+
+1. **写放大**：加锁要改元组头 → 弄脏页面 → 写 WAL（`XLOG_HEAP_LOCK`）→ 最终落盘。锁一百万行 = 弄脏几万个页 + 相应 WAL。InnoDB 加锁是纯内存操作（锁结构不落盘、不进 redo）。所以 PG 的 `SELECT FOR UPDATE` 大批量执行会产生惊人的 I/O，这在方案 A 里是不存在的；
+2. **multixact 复杂度**（8.7.3）：xmax 只有一个槽位，多个事务共锁一行时必须引入"组合 ID"间接层——一整套 SLRU、独立回卷、独立 freeze，是 PG 代码里公认的高危区（9.3/9.4 的著名数据损坏 bug 群，见 8.11）；
+3. **xmax 语义重载**：同一个字段既表示"删除者"又表示"锁定者"还可能是"multixact 组合"，靠 infomask 的位组合区分（`HEAP_XMAX_LOCK_ONLY`/`HEAP_XMAX_IS_MULTI`/...）。8.4.2 走读里 xmax 阶段的分支爆炸（[M2][M3][M4]…）正是这笔账——**每个读者都要替锁买单**：可见性判断必须先排除"xmax 只是锁"的情形。
+
+还有一个结构性代价：**锁状态随元组走，释放就没有"遍历我的锁"的入口**——所以 PG 的行锁**不逐个释放**，事务结束时行上的 xmax 自然失效（读者查 CLOG 发现 locker 已完结）。这也是为什么等待行锁不能"等那一行"，而要绕道：**等行锁 = 等持有者的事务结束 = 对持有者的 XID 拿一把 `LOCKTAG_TRANSACTION` 共享锁**（每个事务在 `AssignTransactionId` 时就对自己的 XID 持有排他"事务锁"）。事务提交/回滚释放事务锁，等待者全部醒来。死锁检测因此依然有效——行锁等待在等待图里表现为"等某个事务锁"，这是 8.8 的输入。
+
+顺带回答一个 MySQL 用户必问的问题：**PG 没有间隙锁**。防幻读不靠锁间隙，RR 靠快照天然无幻读（读已冻结的世界），SERIALIZABLE 靠 SSI 的谓词锁检测（8.9）。因此 PG 也没有 InnoDB 那些"间隙锁导致的意外死锁"，但代价是 SERIALIZABLE 下可能事后回滚。
+
+### 8.7.2 四种行锁模式与 infomask 编码
+
+`src/include/nodes/lockoptions.h:53-59` 定义四种模式（从弱到强）：
+
+| 模式 | SQL | 冲突语义 |
+|---|---|---|
+| LockTupleKeyShare | `FOR KEY SHARE` | 只挡"改键/删行"，允许改非键列 |
+| LockTupleShare | `FOR SHARE` | 挡一切修改，允许共享 |
+| LockTupleNoKeyExclusive | `FOR NO KEY UPDATE`（普通 UPDATE 隐含） | 挡其他排他，允许 KeyShare |
+| LockTupleExclusive | `FOR UPDATE`（DELETE/改键 UPDATE 隐含） | 全排他 |
+
+四种模式塞进 infomask 的几个位（`htup_details.h:194-200`）：
+
+```c
+#define HEAP_XMAX_KEYSHR_LOCK   0x0010  /* xmax is a key-shared locker */
+#define HEAP_XMAX_EXCL_LOCK     0x0040  /* xmax is exclusive locker */
+#define HEAP_XMAX_LOCK_ONLY     0x0080  /* xmax, if valid, is only a locker */
+#define HEAP_XMAX_SHR_LOCK  (HEAP_XMAX_EXCL_LOCK | HEAP_XMAX_KEYSHR_LOCK)
+```
+
+`HEAP_XMAX_LOCK_ONLY` 就是可见性判断里反复出现的那个"xmax 只是锁"标志（[M2] 分支）。KeyShare/NoKeyUpdate 这对模式是 PG 9.3 为外键并发引入的（commit `0ac5ad5134`，2013-01-23，Álvaro Herrera，"Improve concurrency of foreign key locking"）：外键检查只需锁"键不变"（KEY SHARE），普通 UPDATE 只锁"非键更新"（NO KEY UPDATE），两者不冲突——此前外键检查用 FOR SHARE，与一切 UPDATE 冲突，"带外键的表并发更新雪崩"是 9.3 之前的经典投诉。
+
+### 8.7.3 multixact：多个事务锁同一行
+
+共享类锁允许多个事务同时持有，但 xmax 只有一个 32 位槽位怎么办？答案是 **MultiXactId**（`src/backend/access/transam/multixact.c`，头部注释是最佳导读）：造一个新的"组合 ID"写进 xmax，并置 `HEAP_XMAX_IS_MULTI`（`htup_details.h:209`）标志；组合 ID 在 pg_multixact 的**两个 SLRU**（offsets：multi→成员区间起点；members：成员数组）里展开，每个成员 = (XID, 锁模式/更新标志)。
+
+- 创建：`MultiXactIdCreate()`（`multixact.c:358`）/ `MultiXactIdCreateFromMembers()`（`multixact.c:715`）；已有 multixact 再加成员则要**新建**一个包含全部旧成员+新成员的 multixact（multixact 不可变——SLRU 里的成员数组是追加写的定长区间，没法原地扩）；
+- 读取：`GetMultiXactIdMembers()`（`multixact.c:1172`）。可见性判断中 `HeapTupleGetUpdateXid()`（[X2d]/[M3] 分支）就是靠它从成员里挑出真正做了 UPDATE 的那一个（至多一个成员是 updater，其余是纯 locker）；
+- 0ac5ad5134 带来的重大语义变化：9.3 起 multixact 的成员可以包含 **updater**（此前 multi 只装 locker）——于是 multixact 从"可丢弃的临时数据"变成了**参与可见性判断的持久数据**，必须崩溃安全、必须 freeze。这一步棋直接引出了 9.3/9.4 的 bug 风暴（members 区间回卷计算错误、freeze 丢 updater 等，如 commit `b0b263baab` "Wrap multixact/members correctly during extension, take 2"，2014-06-09）。运维上监控 `datminmxid` 年龄与监控 XID 年龄同等重要，`vacuum_multixact_freeze_*` 参数族因此存在。
+
+### 8.7.4 SELECT FOR UPDATE 的路径：heap_lock_tuple
+
+`SELECT ... FOR UPDATE` 的执行计划顶端是 LockRows 节点（`nodeLockRows.c`），对每行经 `table_tuple_lock()`（`heapam_handler.c:265`）落到堆实现 `heap_lock_tuple()`（`src/backend/access/heap/heapam.c:4728`）。主线流程：
+
+1. 读元组，`HeapTupleSatisfiesUpdate()` 判断当前状态：无人占用 → 直接走 3；被占用 → 走 2；
+2. **冲突等待**：根据双方模式查 `tupleLockExtraInfo` 表（四种模式对应的重量级锁级别）决定是否冲突。冲突则视 `wait_policy` 三选一：阻塞等待（`XactLockTableWait` 等持有者的事务锁，multixact 则逐成员等）、`SKIP LOCKED` 跳过、`NOWAIT` 报错。等待前还会先拿该元组的 `LOCKTAG_TUPLE` 重量级锁作为"排队票"，防止饥饿（醒来的人凭它优先接手，接手后立刻释放——所以 pg_locks 里 tuple 锁一闪而过）。回顾 8.6.2 ⑥的红线：行锁等待是分钟级的，必须有强公平性，排队票就是它的实现；
+3. **落锁**：`compute_new_xmax_infomask()` 算出新 xmax（自己的 XID，或与现存 locker 合并成 multixact）与 infomask 位组合，写入元组头，记 WAL（`XLOG_HEAP_LOCK`），完事。
+
+READ COMMITTED 下若行在等待期间被改了，上层 LockRows 用 EPQ 拿新版本重验 WHERE；REPEATABLE READ 下直接报串行化失败——与 8.3.6 的语义一致。
+
+省略说明：`heap_lock_tuple` 全文近 700 行，其中约六成处理 multixact 模式合并与升级等待的组合爆炸（4 种已有状态 × 4 种请求模式 × wait_policy），主干即上述三步，故不逐行走读；`heap_update` 内嵌的"更新即加锁"路径与此同构。
+
+### 小结
+
+- 行锁写在元组 xmax + infomask 里：共享内存零占用、无容量上限、无锁升级；代价是加锁产生页写与 WAL、multixact 间接层的复杂度、xmax 语义重载摊薄每次可见性判断；
+- 等行锁 = 等持有者的 LOCKTAG_TRANSACTION 事务锁；公平性由一闪而过的 LOCKTAG_TUPLE 排队票维持；
+- 四种行锁模式（Key Share / Share / No Key Update / Update）为外键并发而精细化（9.3, 0ac5ad5134）；
+- 多事务共持一行时 xmax 换成 MultiXactId（不可变、双 SLRU、独立回卷/freeze）；9.3 让 updater 进 multi 后它成了持久关键数据，酿出著名 bug 群；
+- PG 无间隙锁：RR 靠快照防幻读，SERIALIZABLE 靠 SSI。
+
+---
+
+## 8.8 死锁检测：deadlock.c
+
+### 8.8.1 所以然：为什么懒触发而不是即时检测？——代价账
+
+PG 不在每次加锁时做死锁预防/即时检测，而是**先睡下去，睡满 `deadlock_timeout`（默认 1s，`proc.c:62`）才起来查一次**。实现：`ProcSleep` 挂起前 `enable_timeout_after(DEADLOCK_TIMEOUT, DeadlockTimeout)`（`proc.c:1438`），定时器到点置标志，等待循环里发现后调用 `CheckDeadLock()`（`proc.c:1530` 调用，实现 `proc.c:1887`）。
+
+把两种策略的成本摆开算：
+
+- **即时检测**（InnoDB 8.0 的默认做法：每次锁等待都从等待者出发做 DFS）：设每秒 B 次锁等待事件，每次 DFS 成本 O(等待图规模)。更糟的是 PG 的检测前提——**锁住全部 16 个锁表分区**（`DeadLockCheck` 的调用约定，`deadlock.c:213` "Caller must already have locked all partitions"）——这等于每次锁等待都短暂冻结全库的加锁/放锁。高并发行锁冲突场景（秒杀式热点行）下，B 可达数千/秒，检测本身会成为比死锁更大的灾难。InnoDB 在 8.0 里也承认了这一点：加了 `innodb_deadlock_detect=OFF` 开关，热点场景下建议关掉检测、纯靠 `innodb_lock_wait_timeout` 兜底——绕了一圈回到 PG 的思路；
+- **懒触发**：只有等待超过 1 秒的进程才付一次检测成本。两个概率事实支撑它：(a) 设计良好的应用里绝大多数锁等待在毫秒级结束——它们**永远不触发检测**；(b) 真死锁不会自己消失——晚 1 秒检测不损失正确性，只增加 1 秒的死锁定格时间，而死锁本身是应用 bug，罕见事件的首次响应延迟 1 秒完全可接受。定量地说：若 99.9% 的等待 < 1s，懒触发把检测频率压掉三个数量级，同时把"全分区冻结"从热路径彻底移除；
+- 检测一次判"无死锁"后**不再重复检测**（继续睡）：死锁的形成需要"新边加入等待图"，而新边意味着**别的进程**开始等待，那个进程自己会武装定时器并负责检测包含新边的图。归纳可证：任何死锁环形成后，最后加入环的那个进程的定时器必然在环形成之后到期，它会看到完整的环——**每个环至少被检测一次**，无漏报。
+
+`deadlock_timeout` 的调参哲学由此清晰：它是"检测灵敏度 vs 检测开销"的旋钮。锁冲突极多的系统可以调大（减少无谓检测），交互式系统可以调小（更快发现死锁）；它同时还是 `log_lock_waits` 的打点阈值。
+
+### 8.8.2 DeadLockCheck 主线走读
+
+等待图（wait-for graph, WFG）：节点 = 进程；**硬边** A→B = "A 等待 B 已**持有**的锁"；PG 还独有**软边** = "A 等待 B 只因 B 在同一把锁的等待队列里**排在 A 前面**且请求模式与 A 冲突"——软边对应的死锁可以通过**重排队列**化解，不必杀任何事务。这是 PG 死锁检测最优雅的一笔：它不仅判"有没有死锁"，还搜索"能否通过调整排队次序让死锁根本不成立"。
+
+**入口 `DeadLockCheck()`（`deadlock.c:220`）**：
+
+```c
+DeadLockState
+DeadLockCheck(PGPROC *proc)
+{
+    nCurConstraints = 0;
+    nPossibleConstraints = 0;
+    nWaitOrders = 0;
+    blocking_autovacuum_proc = NULL;
+
+    if (DeadLockCheckRecurse(proc))                     // 231
+    {
+        /* 无解: 重跑一次 FindLockCycle 填 deadlockDetails[] 供报错打印 */
+        int  nSoftEdges;
+
+        nWaitOrders = 0;
+        if (!FindLockCycle(proc, possibleConstraints, &nSoftEdges))   // 242
+            elog(FATAL, "deadlock seems to have disappeared");
+        return DS_HARD_DEADLOCK;                        // 245: 调用者将中止本事务
+    }
+
+    /* 有解: 按 waitOrders[] 重排相关等待队列 */
+    for (int i = 0; i < nWaitOrders; i++)               // 249
+    {
+        LOCK   *lock = waitOrders[i].lock;
+        PGPROC **procs = waitOrders[i].procs;
+        ...
+        dclist_init(waitQueue);                          // 263: 清空重排
+        for (int j = 0; j < nProcs; j++)
+            dclist_push_tail(waitQueue, &procs[j]->waitLink);
+
+        ProcLockWakeup(GetLocksMethodTable(lock), lock); // 272: 唤醒不再冲突者
+    }
+
+    if (nWaitOrders > 0)
+        return DS_SOFT_DEADLOCK;
+    else if (blocking_autovacuum_proc != NULL)
+        return DS_BLOCKED_BY_AUTOVACUUM;                 // 279
+    else
+        return DS_NO_DEADLOCK;
+}
+```
+
+**`DeadLockCheckRecurse()`（`deadlock.c:312`）——在"约束空间"里做回溯搜索**：
+
+```c
+static bool
+DeadLockCheckRecurse(PGPROC *proc)
+{
+    int  nEdges = TestConfiguration(proc);              // 319
+    if (nEdges < 0)
+        return true;            /* hard deadlock --- no solution */
+    if (nEdges == 0)
+        return false;           /* good configuration found */
+    ...
+    for (i = 0; i < nEdges; i++)                        // 342: 逐个软边试翻转
+    {
+        curConstraints[nCurConstraints++] = possibleConstraints[...];
+        if (!DeadLockCheckRecurse(proc))
+            return false;       /* found a valid solution! */
+        nCurConstraints--;      /* 回溯 */
+    }
+    return true;                /* no solution found */
+}
+```
+
+一个"约束"= "让等待者 A 排到持有者 B 之前"（翻转一条软边）。算法：当前约束集下找环（`TestConfiguration` → `FindLockCycle`，`deadlock.c:378/446`）；环全是硬边 → 无解；环含软边 → 对每条软边尝试"翻转它"加入约束集后递归。本质是在搜索"是否存在某组队列重排使等待图无环"。最坏是软边数的指数，但实际死锁环极小（2~3 个进程），且约束存储有上限（`maxCurConstraints`）超限即放弃治疗判硬死锁——**宁可误杀不可挂死**。
+
+**`FindLockCycle()`/`FindLockCycleRecurse()`（`deadlock.c:446/457`）——DFS 找环**：
+
+```c
+static bool
+FindLockCycleRecurse(PGPROC *checkProc, int depth, ...)
+{
+    /* 469: 并行查询的锁组成员一律折算到组长 */
+    if (checkProc->lockGroupLeader != NULL)
+        checkProc = checkProc->lockGroupLeader;
+
+    for (i = 0; i < nVisitedProcs; i++)                 // 475: 访问过?
+        if (visitedProcs[i] == checkProc)
+            return (i == 0);    /* 回到起点=有环; 撞上支路=无环(对起点而言) */
+
+    visitedProcs[nVisitedProcs++] = checkProc;          // 501
+    ...
+}
+```
+
+真正展开出边的是 `FindLockCycleRecurseMember()`（`deadlock.c:536`）：取 `checkProc->waitLock`，对锁上每个 PROCLOCK 检查 `proclock->holdMask & conflictMask`（`deadlock.c:578-585`）——持有冲突模式者即硬边，递归进去；随后（本节未摘录的后半段，`deadlock.c:600` 起）再扫等待队列里**排在 checkProc 前面**的进程——请求模式冲突者即软边，同样递归，但环若经它闭合则把这条边记进 `softEdges[]` 输出。注意 469 行：**并行查询的一组 worker 在等待图里是一个节点**（组内不算死锁——他们共享锁），这是 9.6 并行执行落地时对死锁检测的静默改造。
+
+回到起点的环使 `nDeadlockDetails = depth`（`deadlock.c:487`），沿递归栈回填每一跳的 (locktag, mode, pid)——这就是报错信息里"Process 123 waits for ShareLock on transaction 456; blocked by process 789"链条的来源。
+
+**软死锁解法生效**：`TopoSort()`（`deadlock.c` 后部）对每个需要重排的等待队列在"A 必须在 B 前"约束下做拓扑排序产出新序，`DeadLockCheck` 主体应用之并 `ProcLockWakeup`——**没有任何事务被杀**。硬死锁则由发起检测的进程自杀（报 `deadlock detected`，`DeadLockReport()` 打印环路详情）。
+
+注意"谁检测谁死"：被牺牲的是**碰巧先睡满 deadlock_timeout 的那个**，不是代价最小的——PG 没有 InnoDB 那种"选 undo 量小的事务回滚"的受害者选择策略。理由还是概率账：死锁太罕见，不值得为选受害者维护每事务的代价估计。另外 `DeadLockCheck` 顺带处理"阻塞了 autovacuum"的情形（`deadlock.c:278-279`）：返回 DS_BLOCKED_BY_AUTOVACUUM，调用者会直接取消那个 autovacuum——普通事务的优先级高于后台清理。
+
+### 8.8.3 what-if：一次死锁的完整时序
+
+两个会话、两行数据（id=1, id=2），推演从形成到裁决的全过程：
+
+```
+t0   A: BEGIN; UPDATE t SET v=v+1 WHERE id=1;
+       -- A 拿到行1: xmax=XID_A; A 持有自己 XID_A 的事务锁(排他)
+t1   B: BEGIN; UPDATE t SET v=v+1 WHERE id=2;
+       -- 对称: 行2 xmax=XID_B
+t2   A: UPDATE t SET v=v+1 WHERE id=2;
+       -- heap_update 发现行2 xmax=XID_B 且 B 未完结
+       -- A 先拿行2的 LOCKTAG_TUPLE 锁(排队票, 无人争, 立得)
+       -- A 对 XID_B 的事务锁发起共享申请 → 冲突(B持排他) → 入队
+       -- ProcSleep: enable_timeout_after(DEADLOCK_TIMEOUT, 1000)  [proc.c:1438]
+       -- 等待图: A --硬边--> B; 无环。
+t3   B: UPDATE t SET v=v+1 WHERE id=1;
+       -- 对称: B 等 XID_A 的事务锁, B 也武装 1s 定时器
+       -- 等待图: A --> B, B --> A: 环已闭合! 但此刻无人知晓。
+t2+1s  A 的定时器先到期(A 先睡的):
+       -- CheckDeadLock [proc.c:1887]: 依序拿下全部 16 个锁表分区 LWLock
+       -- DeadLockCheck(A) → FindLockCycle: A→B(硬), B→A(硬), 回到起点
+       -- 全硬边, 无软边可翻 → DS_HARD_DEADLOCK
+       -- A 自杀: ERROR: deadlock detected
+       --   DETAIL: Process A waits for ShareLock on transaction XID_B; ...
+       -- A 的事务中止 → 释放 XID_A 事务锁 → B 被唤醒, 正常拿锁继续
+t2+1s+ε  B 的 UPDATE 完成; B 可 COMMIT。
+```
+
+几个值得咀嚼的细节：(a) 若 t3 与 t2 间隔超过 1 秒，A 的第一次检测发生在环闭合**之前**，判无死锁后继续睡**且不再检测**——此时靠 B 的定时器兜底（8.8.1 的归纳论证在此兑现：环的最后一条边是 B 加的，B 的定时器必在环成立后到期）；(b) 死掉的是 A（先睡满的），哪怕 A 的事务改了一百万行而 B 只改了一行——无受害者加权；(c) 若把场景换成"A 先 FOR SHARE 锁行1、B 也 FOR SHARE 锁行1、然后两人都想 UPDATE 行1"，等待队列上会出现软边，PG 会尝试重排队列而可能无人被杀——InnoDB 的同款场景（S 锁升 X 锁）则直接判死锁杀一个。
+
+### 小结
+
+- 懒触发的账：检测需冻结全部 16 个锁分区，即时检测在热点冲突下自身成为灾难（InnoDB 8.0 提供关闭开关反向印证）；睡满 1s 才查把检测频率压低几个数量级，且"每环必有最后入环者的定时器在环成立后到期"保证无漏报；
+- 算法分两层：外层在"软边翻转"的约束空间回溯搜索无环解（TopoSort 重排队列，不杀事务），内层 FindLockCycle 做带访问标记的 DFS（硬边=持有冲突，软边=排队在前且冲突；并行查询按锁组折叠为单节点）；
+- 硬死锁的受害者 = 首个检测到环的等待者，无代价加权；阻塞 autovacuum 时优先取消 autovacuum。
+
+---
+
 <!-- CONTINUE -->
